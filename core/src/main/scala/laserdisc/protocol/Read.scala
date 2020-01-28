@@ -7,274 +7,248 @@ import shapeless.labelled._
 import scala.annotation.implicitNotFound
 
 @implicitNotFound(
-  "Implicit not found: Read[${A}, ${B}].\n\n" +
-    "Try writing your own, for example:\n\n" +
-    "implicit final val myRead: Read[${A}, ${B}] = new Read[${A}, ${B}] {\n" +
-    "  override final def read(a: ${A}): Option[${B}] = ???\n" +
-    "}\n\n" +
-    "Note 1: you can use the factory method Read.instance[PF] instead of creating it manually as shown above\n" +
-    "Note 2: make sure to inspect the combinators as you may be able to leverage some other Read instance\n"
+  """Implicit not found Read[${A}, ${B}].
+
+Try writing your own, for example:
+
+implicit final val myRead: Read[${A}, ${B}] = new Read[${A}, ${B}] {
+  override final def read(a: ${A}): Option[${B}] = ???
+}
+
+Note 1: you can use the factory method Read.instance instead of creating it manually as shown above
+Note 2: make sure to inspect the combinators as you may be able to leverage some other Read instance
+"""
 ) trait Read[A, B] { self =>
 
-  def read(a: A): Option[B]
+  def read(a: A): RESPDecErr | B
 
-  final def map[C](f: B => C): Read[A, C] = new Read[A, C] {
-    override final def read(a: A): Option[C] = self.read(a).map(f)
+  final def map[C](f: B => C): Read[A, C] = Read.instance(read(_).map(f))
+
+  final def contramap[C](f: C => A): Read[C, B] = Read.instance(read _ compose f)
+
+  final def flatMap[C](f: B => Read[A, C]): Read[A, C] = Read.instance(a => read(a).flatMap(f(_).read(a)))
+
+  private[this] final val _extract: Any => Read.Extract[Any] = new Read.Extract[Any](_)
+  final def unapply(a: A): Read.Extract[RESPDecErr | B] =
+    _extract(read(a)).asInstanceOf[Read.Extract[RESPDecErr | B]]
+}
+
+object Read extends ReadInstances0 {
+  private[Read] final class Extract[T](private val t: T) extends AnyVal {
+    def isEmpty: Boolean = false
+    def get: T           = t
   }
 
-  final def flatMap[C](f: B => Read[A, C]): Read[A, C] = new Read[A, C] {
-    override final def read(a: A): Option[C] = self.read(a).flatMap(b => f(b).read(a))
+  @inline final def apply[A, B](implicit instance: Read[A, B]): Read[A, B] = instance
+
+  @inline final def instance[A, B](f: A => RESPDecErr | B): Read[A, B] = (a: A) => f(a)
+
+  @inline final def infallible[A, B](f: A => B): Read[A, B] = (a: A) => Right(f(a))
+
+  @inline final def const[A, B](b: B): Read[A, B] = Read.infallible(_ => b)
+
+  @inline final def instancePF[A, B](expectation: String)(pf: PartialFunction[A, B]): Read[A, B] =
+    a => if (pf.isDefinedAt(a)) Right(pf(a)) else Left(RESPDecErr(s"Read Error: expected $expectation but was $a"))
+
+  @inline final def lift2OptionWhen[A, B](cond: A => Boolean)(
+      implicit R: Read[A, B]
+  ): Read[A :+: CNil, Option[B]] = Read.infallible {
+    case Inl(i @ R(Right(b))) if !cond(i) => Some(b)
+    case Inl(_)                           => None
   }
 
-  final def contramap[C](f: C => A): Read[C, B] = new Read[C, B] {
-    override final def read(c: C): Option[B] = self.read(f(c))
-  }
+  @inline final def numMinusOneIsNone[A: Read[Num, *]]: Read[Num :+: CNil, Option[A]] =
+    lift2OptionWhen(_.value == -1L)
 
-  final def zip[C, D](RC: Read[C, D]): Read[(A, C), (B, D)] = new Read[(A, C), (B, D)] {
-    override def read(ac: (A, C)): Option[(B, D)] = {
-      val (a, c) = ac
-      for {
-        b <- self.read(a)
-        d <- RC.read(c)
-      } yield b -> d
+  @inline final def numZeroIsNone[A: Read[Num, *]]: Read[Num :+: CNil, Option[A]] =
+    lift2OptionWhen(_.value == 0L)
+}
+
+trait ReadInstances0 extends ReadInstances1 {
+  implicit final def identity[A]: Read[A, A] = Read.instance(_.asRight)
+}
+
+trait ReadInstances1 extends EitherSyntax with ReadInstances2 {
+  import Read.{infallible, instance, instancePF}
+
+  implicit final val str2StringRead: Read[Str, String] = infallible(_.value)
+  implicit final val str2OKRead: Read[Str, OK]         = instancePF("Str(OK)") { case Str("OK") => OK }
+  implicit final val str2KeyRead: Read[Str, Key]       = instancePF("Str(Key)") { case Str(Key(s)) => s }
+
+  implicit final val num2LongRead: Read[Num, Long] = Read.instance(n => Right(n.value))
+  implicit final val num2BooleanRead: Read[Num, Boolean] = Read.instancePF("0L or 1L") {
+    case Num(0L) => false
+    case Num(1L) => true
+  }
+  implicit final val num2IntRead: Read[Num, Int]                 = instancePF("Num(Int)") { case Num(ToInt(i))                    => i }
+  implicit final val num2NonNegIntRead: Read[Num, NonNegInt]     = instancePF("Num(NonNegInt)") { case Num(ToInt(NonNegInt(i)))   => i }
+  implicit final val num2NonNegLongRead: Read[Num, NonNegLong]   = instancePF("Num(NonNegLong)") { case Num(NonNegLong(l))        => l }
+  implicit final val num2NonZeroIntRead: Read[Num, NonZeroInt]   = instancePF("Num(NonZeroInt)") { case Num(ToInt(NonZeroInt(i))) => i }
+  implicit final val num2NonZeroLongRead: Read[Num, NonZeroLong] = instancePF("Num(NonZeroLong)") { case Num(NonZeroLong(l))      => l }
+  implicit final val num2PosIntRead: Read[Num, PosInt]           = instancePF("Num(PosInt)") { case Num(ToInt(PosInt(i)))         => i }
+  implicit final val num2PosLongRead: Read[Num, PosLong]         = instancePF("Num(PosLong)") { case Num(PosLong(l))              => l }
+  implicit final val num2SlotRead: Read[Num, Slot]               = instancePF("Num(SlotInt)") { case Num(ToInt(Slot(i)))          => i }
+
+  implicit final val bulk2StringRead: Read[Bulk, String] = infallible(_.value)
+  implicit final val bulk2DoubleRead: Read[Bulk, Double] = instancePF("Bulk(Double)") { case Bulk(ToDouble(d)) => d }
+  implicit final val bulk2IntRead: Read[Bulk, Int]       = instancePF("Bulk(Int)") { case Bulk(ToInt(i)) => i }
+  implicit final val bulk2LongRead: Read[Bulk, Long]     = instancePF("Bulk(Long)") { case Bulk(ToLong(l)) => l }
+  implicit final val bulk2ValidDoubleRead: Read[Bulk, ValidDouble] = instancePF("Bulk(ValidDouble)") {
+    case Bulk(ToDouble(ValidDouble(d))) => d
+  }
+  implicit final val bulk2NonNegIntRead: Read[Bulk, NonNegInt]   = instancePF("Bulk(NonNegInt)") { case Bulk(ToInt(NonNegInt(i)))    => i }
+  implicit final val bulk2NonNegLongRead: Read[Bulk, NonNegLong] = instancePF("Bulk(NonNegLong)") { case Bulk(ToLong(NonNegLong(l))) => l }
+  implicit final val bulk2NonNegDoubleRead: Read[Bulk, NonNegDouble] = instancePF("Bulk(NonNegDouble)") {
+    case Bulk(ToDouble(NonNegDouble(d))) => d
+  }
+  implicit final val bulk2NonZeroDoubleRead: Read[Bulk, NonZeroDouble] = instancePF("Bulk(NonZeroDouble)") {
+    case Bulk(ToDouble(NonZeroDouble(d))) => d
+  }
+  implicit final val bulk2NonZeroIntRead: Read[Bulk, NonZeroInt] = instancePF("Bulk(NonZeroInt)") { case Bulk(ToInt(NonZeroInt(i))) => i }
+  implicit final val bulk2NonZeroLongRead: Read[Bulk, NonZeroLong] = instancePF("Bulk(NonZeroLong)") {
+    case Bulk(ToLong(NonZeroLong(l))) => l
+  }
+  implicit final val bulk2PosIntRead: Read[Bulk, PosInt]   = instancePF("Bulk(PosInt)") { case Bulk(ToInt(PosInt(i)))    => i }
+  implicit final val bulk2PosLongRead: Read[Bulk, PosLong] = instancePF("Bulk(PosLong)") { case Bulk(ToLong(PosLong(l))) => l }
+  implicit final val bulk2ConnectionNameRead: Read[Bulk, ConnectionName] = instancePF("Bulk(ConnectionName)") {
+    case Bulk(ConnectionName(cn)) => cn
+  }
+  implicit final val bulk2KeyRead: Read[Bulk, Key]         = instancePF("Bulk(Key)") { case Bulk(Key(k))          => k }
+  implicit final val bulk2GeoHashRead: Read[Bulk, GeoHash] = instancePF("Bulk(GeoHash)") { case Bulk(GeoHash(gh)) => gh }
+
+  implicit final def arrOfBulk2Seq[A](implicit R: Read[Bulk, A]): Read[Arr, Seq[A]] = Read.instance {
+    case Arr(vector) =>
+      vector.foldRight[RESPDecErr | (List[A], Int)](Right(Nil -> 0)) {
+        case (R(Right(a)), Right((as0, asl))) => Right((a :: as0) -> (asl + 1))
+        case (R(Left(e)), Right((_, asl)))    => Left(RESPDecErr(s"Arr(Bulk) ==> Seq[A] error at element ${asl + 1}: ${e.message}"))
+        case (other, Right((_, asl))) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[A] error at element ${asl + 1}: Unexpected for Bulk. Was $other"))
+        case (_, left) => left
+      } map (_._1)
+  }
+  implicit final def arrOfArr2Seq[A](implicit R: Read[Arr, A]): Read[Arr, Seq[A]] = instance {
+    case Arr(vector) =>
+      vector.foldRight[RESPDecErr | (List[A], Int)](Right(Nil -> 0)) {
+        case (R(Right(a)), Right((as0, asl))) => Right((a :: as0) -> (asl + 1))
+        case (R(Left(e)), Right((_, asl)))    => Left(RESPDecErr(s"Arr(Arr) ==> Seq[A] error at element ${asl + 1}: ${e.message}"))
+        case (other, Right((_, asl))) =>
+          Left(RESPDecErr(s"Arr(Arr) ==> Seq[A] error at element ${asl + 1}: Unexpected for Arr. Was $other"))
+        case (_, left) => left
+      } map (_._1)
+  }
+  implicit final def arrOfBulk2OptionSeq[A](implicit R: Read[Bulk, A]): Read[Arr, Seq[Option[A]]] = instance {
+    case Arr(vector) =>
+      vector.foldRight[RESPDecErr | (List[Option[A]], Int)](Right(Nil -> 0)) {
+        case (NullBulk, Right((as0, asl)))    => Right((None :: as0) -> (asl + 1))
+        case (R(Right(a)), Right((as0, asl))) => Right((Some(a) :: as0) -> (asl + 1))
+        case (R(Left(e)), Right((_, asl)))    => Left(RESPDecErr(s"Arr(Bulk) ==> Seq[Option[A]] error at element ${asl + 1}: ${e.message}"))
+        case (other, Right((_, asl))) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[Option[A]] error at element ${asl + 1}: Unexpected for Bulk. Was $other"))
+        case (_, left) => left
+      } map (_._1)
+  }
+  implicit final def arrOfArr2OptionSeq[A](implicit R: Read[Arr, A]): Read[Arr, Seq[Option[A]]] = instance {
+    case Arr(vector) =>
+      vector.foldRight[RESPDecErr | (List[Option[A]], Int)](Right(Nil -> 0)) {
+        case (NilArr, Right((as0, asl)))      => Right((None :: as0) -> (asl + 1))
+        case (R(Right(a)), Right((as0, asl))) => Right((Some(a) :: as0) -> (asl + 1))
+        case (R(Left(e)), Right((_, asl)))    => Left(RESPDecErr(s"Arr(Arr) ==> Seq[Option[A]] error at element ${asl + 1}: ${e.message}"))
+        case (other, Right((_, asl))) =>
+          Left(RESPDecErr(s"Arr(Arr) ==> Seq[Option[A]] error at element ${asl + 1}: Unexpected for Arr. Was $other"))
+        case (_, left) => left
+      } map (_._1)
+  }
+  implicit final def arr2Tuple2Read[A, B](implicit RA: Read[Bulk, A], RB: Read[Bulk, B]): Read[Arr, (A, B)] =
+    instancePF("Arr(A, B)") {
+      case Arr(RA(Right(a)) +: RB(Right(b)) +: Seq()) => a -> b
     }
+  implicit final def arr2Tuple2Seq[A, B](implicit RA: Read[Bulk, A], RB: Read[Bulk, B]): Read[Arr, Seq[(A, B)]] = instance {
+    case Arr(vector) =>
+      vector.grouped(2).foldRight[RESPDecErr | (List[(A, B)], Int)](Right(Nil -> 0)) {
+        case (RA(Right(a)) +: RB(Right(b)) +: Seq(), Right((abs0, absl))) =>
+          Right(((a -> b) :: abs0) -> (absl + 1))
+        case (RA(Left(ea)) +: _ +: Seq(), Right((_, absl))) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[(A, B)] error in the first element at pair ${absl + 1}: ${ea.message}"))
+        case (_ +: RA(Left(eb)) +: Seq(), Right((_, absl))) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[(A, B)] error in the second element at pair ${absl + 1}: ${eb.message}"))
+        case (otherA +: otherB +: Seq(), Right((_, absl))) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[(A, B)] error at element ${absl + 1}: Unexpected for A or B. Was ${(otherA, otherB)}"))
+        case (_ +: Seq(), Right(_)) =>
+          Left(RESPDecErr(s"Arr(Bulk) ==> Seq[(A, B)] error: uneven number of elements in Arr. Can't form pairs."))
+        case (_, left) => left
+      } map (_._1)
   }
-
-  final def unapply(a: A): Option[B] = read(a)
-}
-
-object Read extends LowPriorityReadInstances {
-  @inline final def apply[A, B](implicit instance: A ==> B): A ==> B = instance
-
-  final def instance[A, B](f: A => Option[B]): A ==> B = new Read[A, B] {
-    override def read(a: A): Option[B] = f(a)
+  implicit final val arr2Map: Read[Arr, Map[Key, String]] = instance {
+    case Arr(vector) =>
+      vector.grouped(2).foldRight[RESPDecErr | (Map[Key, String], Int)](Right(Map.empty -> 0)) {
+        case (Bulk(Key(k)) +: Bulk(v) +: Seq(), Right((kvs, kvl))) =>
+          Right(((kvs + (k -> v)) -> (kvl + 1)))
+        case (Bulk(Key(_)) +: any +: Seq(), Right((_, kvl))) =>
+          Left(RESPDecErr(s"Arr ==> Map[Key, String] error in the value at pair ${kvl + 1}: $any is not Bulk(String)"))
+        case (any +: Bulk(_) +: Seq(), Right((_, kvl))) =>
+          Left(RESPDecErr(s"Arr ==> Map[Key, String] error in the key at pair ${kvl + 1}: $any is not Key(String)"))
+        case (_ +: Seq(), Right(_)) =>
+          Left(RESPDecErr(s"Arr ==> Map[Key, String] error: uneven number of elements in Arr. Can't form a Map."))
+        case (_, left) => left
+      } map (_._1)
   }
-  final def instancePF[A, B](pf: PartialFunction[A, B]): A ==> B = instance(pf.lift)
-
-  final def lift2OptionWhen[A, B](cond: A => Boolean)(
-      implicit R: A ==> B
-  ): (A :+: CNil) ==> Option[B] = Read.instancePF {
-    case Inl(i @ R(b)) if !cond(i) => Some(b)
-    case Inl(_)                    => None
+  implicit final val arr2ScanKV: Read[Arr, ScanKV] = instance {
+    case Arr(Bulk(ToLong(NonNegLong(cursor))) +: NilArr +: Seq()) => Right(ScanKV(cursor, None))
+    case Arr(Bulk(ToLong(NonNegLong(cursor))) +: Arr(vector) +: Seq()) =>
+      vector.grouped(2).foldRight[RESPDecErr | (List[KV[String]], Int)](Right(Nil -> 0)) {
+        case (Bulk(Key(k)) +: Bulk(v) +: Seq(), Right((kv, kvl))) =>
+          Right((KV(k, v) :: kv) -> (kvl + 1))
+        case (Bulk(Key(_)) +: any +: Seq(), Right((_, kvl))) =>
+          Left(RESPDecErr(s"Arr ==> ScanKV error in the value at pair ${kvl + 1}: $any is not Bulk(String)"))
+        case (any +: Bulk(_) +: Seq(), Right((_, kvl))) =>
+          Left(RESPDecErr(s"Arr ==> ScanKV error in the key at pair ${kvl + 1}: $any is not Key(String)"))
+        case (_ +: Seq(), Right(_)) =>
+          Left(RESPDecErr(s"Arr ==> ScanKV error: uneven number of elements in Arr. Can't form a KV[String]."))
+        case (_, left) => left
+      } map (r => ScanKV(cursor, Some(r._1)))
   }
-
-  final def integerMinusOneIsNone[A](
-      implicit ev: Integer ==> A
-  ): (Integer :+: CNil) ==> Option[A] = lift2OptionWhen(_.value == -1L)
-  final def integerZeroIsNone[A](
-      implicit ev: Integer ==> A
-  ): (Integer :+: CNil) ==> Option[A] = lift2OptionWhen(_.value == 0L)
-
-  implicit final def identity[A]: A ==> A = instance(Some(_))
-}
-
-trait LowPriorityReadInstances extends LowerPriorityReadInstances {
-  implicit final val simpleString2StringRead: SimpleString ==> String = Read.instance {
-    case SimpleString(s) => Some(s)
+  implicit final def arr2KV[A](implicit R: Read[Bulk, A]): Read[Arr, KV[A]] = instancePF("Arr(KV[A])") {
+    case Arr(Bulk(Key(k)) +: R(Right(a)) +: Seq()) => KV(k, a)
   }
-  implicit final val simpleString2OKRead: SimpleString ==> "OK" = Read.instancePF {
-    case SimpleString("OK") => "OK"
+  implicit final def arr2Scan[A](implicit R: Read[Arr, Seq[A]]): Read[Arr, Scan[A]] = instancePF("Arr(Scan[A])") {
+    case Arr(Bulk(ToLong(NonNegLong(cursor))) +: NilArr +: Seq())       => Scan(cursor, None)
+    case Arr(Bulk(ToLong(NonNegLong(cursor))) +: R(Right(as)) +: Seq()) => Scan(cursor, Some(as))
   }
-  implicit final val simpleString2KeyRead: SimpleString ==> Key = Read.instancePF {
-    case SimpleString(Key(s)) => s
+  implicit final val arr2TimeRead: Read[Arr, Time] = instancePF("Arr(Time)") {
+    case Arr(Bulk(ToLong(NonNegLong(ts))) +: Bulk(ToLong(NonNegLong(em))) +: Seq()) => Time(ts, em)
   }
-
-  implicit final val integer2BooleanRead: Integer ==> Boolean = Read.instancePF {
-    case Integer(0L) => false
-    case Integer(1L) => true
-  }
-  implicit final val integer2IntRead: Integer ==> Int = Read.instancePF { //TODO: maybe useless
-    case Integer(ToInt(i)) => i
-  }
-  implicit final val integer2LongRead: Integer ==> Long = Read.instancePF {
-    case Integer(l) => l
-  }
-  implicit final val integer2NonNegIntRead: Integer ==> NonNegInt = Read.instancePF {
-    case Integer(ToInt(NonNegInt(i))) => i
-  }
-  implicit final val integer2NonNegLongRead: Integer ==> NonNegLong = Read.instancePF {
-    case Integer(NonNegLong(l)) => l
-  }
-  implicit final val integer2NonZeroIntRead: Integer ==> NonZeroInt = Read.instancePF {
-    case Integer(ToInt(NonZeroInt(i))) => i
-  }
-  implicit final val integer2NonZeroLongRead: Integer ==> NonZeroLong = Read.instancePF {
-    case Integer(NonZeroLong(l)) => l
-  }
-  implicit final val integer2PosIntRead: Integer ==> PosInt = Read.instancePF {
-    case Integer(ToInt(PosInt(i))) => i
-  }
-  implicit final val integer2PosLongRead: Integer ==> PosLong = Read.instancePF {
-    case Integer(PosLong(l)) => l
-  }
-
-  implicit final val nonNullBulkString2StringRead: NonNullBulkString ==> String = Read.instance {
-    case NonNullBulkString(s) => Some(s)
-  }
-  implicit final val nonNullBulkString2DoubleRead: NonNullBulkString ==> Double = Read.instancePF {
-    case NonNullBulkString(ToDouble(d)) => d
-  }
-  implicit final val nonNullBulkString2IntRead: NonNullBulkString ==> Int = Read.instancePF { //TODO: maybe useless
-    case NonNullBulkString(ToInt(i)) => i
-  }
-  implicit final val nonNullBulkString2LongRead: NonNullBulkString ==> Long = Read.instancePF {
-    case NonNullBulkString(ToLong(l)) => l
-  }
-  implicit final val nonNullBulkString2ValidDoubleRead: NonNullBulkString ==> ValidDouble = Read.instancePF {
-    case NonNullBulkString(ToDouble(ValidDouble(d))) => d
-  }
-  implicit final val nonNullBulkString2NonNegIntRead: NonNullBulkString ==> NonNegInt = Read.instancePF {
-    case NonNullBulkString(ToInt(NonNegInt(i))) => i
-  }
-  implicit final val nonNullBulkString2NonNegLongRead: NonNullBulkString ==> NonNegLong = Read.instancePF {
-    case NonNullBulkString(ToLong(NonNegLong(l))) => l
-  }
-  implicit final val nonNullBulkString2NonZeroDoubleRead: NonNullBulkString ==> NonZeroDouble = Read.instancePF {
-    case NonNullBulkString(ToDouble(NonZeroDouble(d))) => d
-  }
-  implicit final val nonNullBulkString2NonZeroIntRead: NonNullBulkString ==> NonZeroInt = Read.instancePF {
-    case NonNullBulkString(ToInt(NonZeroInt(i))) => i
-  }
-  implicit final val nonNullBulkString2NonZeroLongRead: NonNullBulkString ==> NonZeroLong = Read.instancePF {
-    case NonNullBulkString(ToLong(NonZeroLong(l))) => l
-  }
-  implicit final val nonNullBulkString2PosIntRead: NonNullBulkString ==> PosInt = Read.instancePF {
-    case NonNullBulkString(ToInt(PosInt(i))) => i
-  }
-  implicit final val nonNullBulkString2PosLongRead: NonNullBulkString ==> PosLong = Read.instancePF {
-    case NonNullBulkString(ToLong(PosLong(l))) => l
-  }
-  implicit final val nonNullBulkString2ConnectionNameRead: NonNullBulkString ==> ConnectionName = Read.instancePF {
-    case NonNullBulkString(ConnectionName(connectionName)) => connectionName
-  }
-  implicit final val nonNullBulkString2KeyRead: NonNullBulkString ==> Key = Read.instancePF {
-    case NonNullBulkString(Key(s)) => s
-  }
-
-  implicit final def nonNilArray2Seq[A](
-      implicit R: NonNullBulkString ==> A
-  ): NonNilArray ==> Seq[A] = Read.instance {
-    case NonNilArray(vector) =>
-      val (vectorLength, (as, asLength)) = vector.foldLeft(0 -> (List.empty[A] -> 0)) {
-        case ((vl, (as0, asl)), R(a)) => (vl + 1) -> ((a :: as0) -> (asl + 1))
-        case ((vl, acc), _)           => (vl + 1) -> acc
-      }
-      if (vectorLength == asLength) Some(as.reverse) else None
-    case _ => None
-  }
-
-  implicit final def nonNilArray2Tuple2Read[A, B](
-      implicit RA: NonNullBulkString ==> A,
-      RB: NonNullBulkString ==> B,
-  ): NonNilArray ==> (A, B) = Read.instancePF {
-    case NonNilArray(RA(key) +: RB(value) +: Seq()) => key -> value
-  }
-
-  implicit final def nonNilArray2Tuple2Seq[A, B](
-      implicit RA: NonNullBulkString ==> A,
-      RB: NonNullBulkString ==> B
-  ): NonNilArray ==> Seq[(A, B)] = Read.instance {
-    case NonNilArray(vector) =>
-      val (vectorLength, (kvs, kvsLength)) =
-        vector.grouped(2).foldLeft(0 -> (List.empty[(A, B)] -> 0)) {
-          case ((vl, (kv, kvl)), RA(a) +: RB(b) +: Seq()) => (vl + 1) -> (((a -> b) :: kv) -> (kvl + 1))
-          case ((vl, acc), _)                             => (vl + 1) -> acc
-        }
-      if (vectorLength == kvsLength) Some(kvs.reverse) else None
-    case _ => None
-  }
-
-  implicit final def nonNilArray2Scan[A](
-      implicit R: NonNilArray ==> Seq[A]
-  ): NonNilArray ==> Scan[A] = Read.instance {
-    case NonNilArray(NonNullBulkString(ToLong(NonNegLong(cursor))) +: NilArray +: Seq()) =>
-      Some(Scan(cursor, None))
-    case NonNilArray(NonNullBulkString(ToLong(NonNegLong(cursor))) +: R(as) +: Seq()) =>
-      Some(Scan(cursor, Some(as)))
-    case _ => None
-  }
-
-  implicit final val nonNilArray2Map: NonNilArray ==> Map[Key, String] = Read.instance {
-    case NonNilArray(vector) =>
-      val (vectorLength, (kvs, kvsLength)) =
-        vector.grouped(2).foldLeft(0 -> (Map.empty[Key, String] -> 0)) {
-          case ((vl, (kv, kvl)), NonNullBulkString(Key(k)) +: NonNullBulkString(v) +: Seq()) =>
-            (vl + 1) -> ((kv + (k -> v)) -> (kvl + 1))
-          case ((vl, acc), _) => (vl + 1) -> acc
-        }
-      if (vectorLength == kvsLength) Some(kvs) else None
-    case _ => None
-  }
-  implicit final val nonNilArray2ScanKV: NonNilArray ==> ScanKV = Read.instance {
-    case NonNilArray(NonNullBulkString(ToLong(NonNegLong(cursor))) +: NilArray +: Seq()) =>
-      Some(ScanKV(cursor, None))
-    case NonNilArray(NonNullBulkString(ToLong(NonNegLong(cursor))) +: NonNilArray(vector) +: Seq()) =>
-      val (vectorLength, (kvs, kvsLength)) =
-        vector.grouped(2).foldLeft(0 -> (List.empty[KV[String]] -> 0)) {
-          case ((vl, (kv, kvl)), NonNullBulkString(Key(k)) +: NonNullBulkString(v) +: Seq()) =>
-            (vl + 1) -> ((KV(k, v) :: kv) -> (kvl + 1))
-          case ((vl, acc), _) => (vl + 1) -> acc
-        }
-      if (vectorLength == kvsLength) Some(ScanKV(cursor, Some(kvs.reverse))) else None
-    case _ => None
-  }
-  implicit final val nonNilArray2TimeRead: NonNilArray ==> Time = Read.instancePF {
-    case NonNilArray(
-        NonNullBulkString(ToLong(NonNegLong(ts))) +: NonNullBulkString(ToLong(NonNegLong(em))) +: Seq()
-        ) =>
-      Time(ts, em)
-  }
-
-  implicit final def nonNilArrayToProduct[P <: Product, L <: HList](
-      implicit G: LabelledGeneric.Aux[P, L],
-      R: NonNilArray ==> L
-  ): NonNilArray ==> P = Read.instancePF {
-    case R(l) => G.from(l)
-  }
-
-  implicit final def nonNilArray2LabelledHCons[HK <: Symbol, HV, T <: HList](
+  implicit final def arr2LabelledHCons[HK <: Symbol, HV, T <: HList](
       implicit HK: Witness.Aux[HK],
-      RHV: NonNullBulkString ==> HV,
-      RT: NonNilArray ==> T
-  ): NonNilArray ==> (FieldType[HK, HV] :: T) = Read.instance {
-    case NonNilArray(NonNullBulkString(HK.value.`name`) +: RHV(hv) +: rest) =>
-      RT.read(RESP.arr(rest)).map(t => field[HK](hv) :: t)
-    case _ => None
+      RHV: Read[Bulk, HV],
+      RT: Read[Arr, T]
+  ): Read[Arr, FieldType[HK, HV] :: T] = instance {
+    case Arr(Bulk(HK.value.`name`) +: RHV(Right(hv)) +: rest) => RT.read(Arr(rest)).map(t => field[HK](hv) :: t)
+    case Arr(other)                                           => Left(RESPDecErr(s"Read Error: expected `[K, V] :: T` but was $other"))
   }
-
-  implicit final def nonNilArray2HCons[H, T <: HList](
-      implicit ev: H <:!< FieldType[_, _],
-      RH: NonNullBulkString ==> H,
-      RT: NonNilArray ==> T
-  ): NonNilArray ==> (H :: T) = Read.instance {
-    case NonNilArray(RH(h) +: rest) => RT.read(RESP.arr(rest)).map(h :: _)
+  implicit final def arr2HCons[H: <:!<[*, FieldType[_, _]], T <: HList](
+      implicit RH: Read[Bulk, H],
+      RT: Read[Arr, T]
+  ): Read[Arr, H :: T] = instance {
+    case Arr(RH(Right(h)) +: rest) => RT.read(Arr(rest)).map(h :: _)
+    case Arr(other)                => Left(RESPDecErr(s"Read Error: expected `H :: T` but was $other"))
   }
-
-  implicit final val nonNilArray2HNil: NonNilArray ==> HNil = Read.instancePF {
-    case NonNilArray(Seq()) => HNil
-  }
+  implicit final val arr2HNil: Read[Arr, HNil] = instancePF("Arr(Seq())") { case Arr(Seq()) => HNil }
 }
 
-sealed trait LowerPriorityReadInstances {
-  final type ==>[A, B] = Read[A, B]
-
-  implicit final def liftNonNullBulkString2Option[A, B](
-      implicit R: A ==> B
-  ): (NullBulkString :+: A :+: CNil) ==> Option[B] = Read.instancePF {
-    case Inl(_)         => None
-    case Inr(Inl(R(b))) => Some(b)
-  }
-  implicit final def liftNonNilArray2Option[A, B](
-      implicit R: A ==> B
-  ): (NilArray :+: A :+: CNil) ==> Option[B] = Read.instancePF {
-    case Inl(_)         => None
-    case Inr(Inl(R(b))) => Some(b)
-  }
-
-  implicit final def liftSimpleToSum[A, B](
-      implicit R: A ==> B,
-      ev: A <:!< Coproduct
-  ): (A :+: CNil) ==> B = Read.instancePF {
-    case Inl(R(b)) => b
-  }
+sealed trait ReadInstances2 {
+  implicit final def liftNullBulk2Option[A, B](implicit R: Read[A, B]): Read[A :+: NullBulk :+: CNil, Option[B]] =
+    Read.infallible {
+      case Inl(R(Right(b))) => Some(b)
+      case Inr(_)           => None
+    }
+  implicit final def liftNilArr2Option[A, B](implicit R: Read[A, B]): Read[A :+: NilArr :+: CNil, Option[B]] =
+    Read.infallible {
+      case Inl(R(Right(b))) => Some(b)
+      case Inr(_)           => None
+    }
+  implicit final def liftSimpleToSum[A: <:!<[*, Coproduct], B](implicit R: Read[A, B]): Read[A :+: CNil, B] =
+    Read.instance {
+      case Inl(R(rb)) => rb
+      case Inl(R(le)) => le
+    }
 }

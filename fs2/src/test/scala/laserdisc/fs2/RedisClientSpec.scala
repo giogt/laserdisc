@@ -1,66 +1,63 @@
 package laserdisc
 package fs2
 
-import java.nio.channels.AsynchronousChannelGroup.withThreadPool
-import java.util.concurrent.Executors.newFixedThreadPool
 import java.util.concurrent.ForkJoinPool
 
-import cats.Monad
 import cats.effect._
-import cats.instances.list._
 import cats.syntax.applicativeError._
 import cats.syntax.apply._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.traverse._
-import eu.timepit.refined.auto._
-import eu.timepit.refined.numeric._
-import log.effect.fs2.Fs2LogWriter.noOpLogStream
-import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpecLike}
+import laserdisc.auto._
+import log.effect.LogWriter
+import log.effect.fs2.SyncLogWriter.noOpLog
+import org.scalatest.{Matchers, WordSpecLike}
 
+import scala.collection.parallel.immutable.ParSeq
 import scala.concurrent.ExecutionContext
 import scala.concurrent.ExecutionContext.fromExecutor
 
-/**
-  * This test will be enabled back when the docker support
-  * for the CI tests will be complete
-  */
-final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAfterAll {
+final class RedisClientSpec extends RedisClientBaseSpec[IO] {
+  private[this] val ec: ExecutionContext = fromExecutor(new ForkJoinPool())
 
-  override def beforeAll(): Unit = super.beforeAll()
-  override def afterAll(): Unit  = super.afterAll()
+  override implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
+  override implicit val timer: Timer[IO]               = IO.timer(ec)
+  override implicit val concurrent: Concurrent[IO]     = IO.ioConcurrentEffect
+  override implicit val logger: LogWriter[IO]          = noOpLog[IO]
 
-  implicit val ec: ExecutionContext           = fromExecutor(new ForkJoinPool())
-  implicit val timer: Timer[IO]               = IO.timer(ec)
-  implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
+  override def run[A]: IO[A] => A = _.unsafeRunSync()
+}
 
-  private[this] final val testKey  = Key("test-key")
-  private[this] final val testText = "test text"
+abstract class RedisClientBaseSpec[F[_]] extends WordSpecLike with Matchers {
+  implicit def contextShift: ContextShift[F]
+  implicit def timer: Timer[F]
+  implicit def concurrent: Concurrent[F]
+  implicit def logger: LogWriter[F]
+
+  def run[A]: F[A] => A
+
+  private[this] final val key: Key = "test-key"
+  private[this] final val text     = "test text"
   private[this] final val correct  = "correct"
 
-  def clientUnderTest[F[_]: Timer](implicit F: ConcurrentEffect[F]): Stream[F, RedisClient[F]] =
-    Stream
-      .resource(MkResource(F.delay(withThreadPool(newFixedThreadPool(8)))))
-      .flatMap { implicit acg =>
-        noOpLogStream[F].flatMap { implicit log =>
-          RedisClient[F](Set(RedisAddress("127.0.0.1", 6379)))
-        }
-      }
+  def clientUnderTest: Resource[F, RedisClient[F]] =
+    RedisClient.toNode("127.0.0.1", 6379)
 
-  "an fs2 redis client" ignore {
+  "an fs2 redis client" should {
+    import cats.instances.list.catsStdInstancesForList
 
     "handle correctly hundreds of read requests in parallel for a large bulk text payload" in {
+      val payload = (1 to 1000).toList map (_ => text) mkString " - "
 
-      val testPayload = (1 to 1000).toList map (_ => testText) mkString " - "
+      def preset(cl: RedisClient[F]): F[Unit] =
+        cl.send(strings.set(key, payload)) >>= (_ => concurrent.unit)
 
-      def testPreset[F[_]](cl: RedisClient[F])(implicit F: Monad[F]): F[Unit] =
-        cl.send1(strings.set(testKey, testPayload)) flatMap (_ => F.unit)
-
-      def testRequests[F[_]](cl: RedisClient[F])(implicit F: Concurrent[F]): F[List[String]] =
-        (((1 to 300) map { _ =>
-          F.start { cl.send1(strings.get[String](testKey)) }
-        }).par map { ioFib =>
-          ioFib flatMap (_.join.attempt)
+      def requests(cl: RedisClient[F]): F[List[String]] =
+        (collection.parallel.immutable.ParSeq.range(0, 300) map { _ =>
+          concurrent.start { cl.send(strings.get[String](key)): F[Maybe[Option[String]]] }
+        } map { ioFib =>
+          ioFib >>= (_.join.attempt)
         } map {
           _.map(
             _.fold(
@@ -73,27 +70,24 @@ final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAft
           )
         }).toList.sequence
 
-      val testResponses =
-        (clientUnderTest[IO] evalMap { cl =>
-          testPreset(cl) *> testRequests(cl)
-        }).compile.last map (
-          _ getOrElse Nil
-        ) unsafeRunSync ()
+      val responses =
+        (run[List[String]] compose clientUnderTest.use) { cl =>
+          preset(cl) *> requests(cl)
+        }
 
-      testResponses.size should be(300)
-      testResponses map (_ should be(testPayload))
+      responses.size should be(300)
+      responses map (_ should be(payload))
     }
 
     "handle correctly some read requests in a row for a bulk text payload" in {
+      val payload = (1 to 1000).toList map (_ => text) mkString " - "
 
-      val testPayload = (1 to 1000).toList map (_ => testText) mkString " - "
+      def preset(cl: RedisClient[F]): F[Unit] =
+        cl.send(strings.set(key, payload)) >>= (_ => concurrent.unit)
 
-      def testPreset[F[_]](cl: RedisClient[F])(implicit F: Monad[F]): F[Unit] =
-        cl.send1(strings.set(testKey, testPayload)) flatMap (_ => F.unit)
-
-      def testRequests[F[_]](cl: RedisClient[F])(implicit F: Concurrent[F]): F[List[String]] =
+      def requests(cl: RedisClient[F]): F[List[String]] =
         ((1 to 50) map { _ =>
-          cl.send1(strings.get[String](testKey)) map (
+          cl.send(strings.get[String](key)) map (
             _.fold(
               _ => "",
               _.getOrElse("")
@@ -106,29 +100,26 @@ final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAft
           )
         )
 
-      val testResponses =
-        (clientUnderTest[IO] evalMap { cl =>
-          testPreset(cl) *> testRequests(cl)
-        }).compile.last map (
-          _ getOrElse Nil
-        ) unsafeRunSync ()
+      val responses =
+        (run[List[String]] compose clientUnderTest.use) { cl =>
+          preset(cl) *> requests(cl)
+        }
 
-      testResponses.size should be(50)
-      testResponses map (_ should be(testPayload))
+      responses.size should be(50)
+      responses map (_ should be(payload))
     }
 
     "handle correctly hundreds of read requests in parallel for a small bulk text payload" in {
+      val payload = "test text"
 
-      val testPayload = "test text"
+      def preset(cl: RedisClient[F]): F[Unit] =
+        cl.send(strings.set(key, payload)) >>= (_ => concurrent.unit)
 
-      def testPreset[F[_]](cl: RedisClient[F])(implicit F: Monad[F]): F[Unit] =
-        cl.send1(strings.set(testKey, testPayload)) flatMap (_ => F.unit)
-
-      def testRequests[F[_]](cl: RedisClient[F])(implicit F: Concurrent[F]): F[List[String]] =
-        (((1 to 1000) map { _ =>
-          F.start { cl.send1(strings.get[String](testKey)) }
-        }).par map { ioFib =>
-          ioFib flatMap (_.join.attempt)
+      def requests(cl: RedisClient[F]): F[List[String]] =
+        (ParSeq.range(0, 1000) map { _ =>
+          concurrent.start { cl.send(strings.get[String](key)) }
+        } map { ioFib =>
+          ioFib >>= (_.join.attempt)
         } map {
           _.map(
             _.fold(
@@ -141,26 +132,23 @@ final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAft
           )
         }).toList.sequence
 
-      val testResponses =
-        (clientUnderTest[IO] evalMap { cl =>
-          testPreset(cl) *> testRequests(cl)
-        }).compile.last map (
-          _ getOrElse Nil
-        ) unsafeRunSync ()
+      val responses =
+        (run[List[String]] compose clientUnderTest.use) { cl =>
+          preset(cl) *> requests(cl)
+        }
 
-      testResponses.size should be(1000)
-      testResponses map (_ should be(testPayload))
+      responses.size should be(1000)
+      responses map (_ should be(payload))
     }
 
     "handle correctly hundreds of read requests in parallel for a null bulk payload" in {
+      val key: Key = "non-existent-test-key"
 
-      val testKey = Key("non-existent-test-key")
-
-      def testRequests[F[_]](cl: RedisClient[F])(implicit F: Concurrent[F]): F[List[String]] =
-        (((1 to 1000) map { _ =>
-          F.start { cl.send1(strings.get[String](testKey)) }
-        }).par map { ioFib =>
-          ioFib flatMap (_.join.attempt)
+      def requests(cl: RedisClient[F]): F[List[String]] =
+        (ParSeq.range(0, 1000) map { _ =>
+          concurrent.start { cl.send(strings.get[String](key)) }
+        } map { ioFib =>
+          ioFib >>= (_.join.attempt)
         } map {
           _.map(
             _.fold(
@@ -173,35 +161,32 @@ final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAft
           )
         }).toList.sequence
 
-      val testResponses =
-        (clientUnderTest[IO] evalMap (cl => testRequests(cl))).compile.last map (
-          _ getOrElse Nil
-        ) unsafeRunSync ()
+      val responses =
+        (run[List[String]] compose clientUnderTest.use) { cl =>
+          requests(cl)
+        }
 
-      testResponses.size should be(1000)
-      testResponses map (_ should be(correct))
+      responses.size should be(1000)
+      responses map (_ should be(correct))
     }
 
     "handle correctly hundreds of read requests in parallel for an array payload" in {
+      implicit val listStringShow: Show[List[String]] = _ mkString COMMA
 
-      implicit object myShow1 extends Show[List[String]] {
-        final def show(a: List[String]): String = a mkString ","
-      }
+      val key: Key = "test-key-list"
+      val bulk     = (1 to 1000).toList map (_ => text) mkString " - "
 
-      val testKey  = Key("test-key-list")
-      val testBulk = (1 to 1000).toList map (_ => testText) mkString " - "
+      def cleanup(cl: RedisClient[F]): F[Unit] =
+        cl.send(lists.lrem(key, 0L, bulk)) >>= (_ => concurrent.unit)
 
-      def testCleanup[F[_]](cl: RedisClient[F])(implicit F: Monad[F]): F[Unit] =
-        cl.send1(lists.lrem(testKey, 0L, testBulk)) flatMap (_ => F.unit)
+      def preset(cl: RedisClient[F]): F[Unit] =
+        (1 to 100).map(_ => cl.send(lists.rpush(key, bulk :: Nil))).toList.sequence >>= (_ => concurrent.unit)
 
-      def testPreset[F[_]](cl: RedisClient[F])(implicit F: Monad[F]): F[Unit] =
-        (1 to 100).map(_ => cl.send1(lists.rpush(testKey, testBulk :: Nil))).toList.sequence flatMap (_ => F.unit)
-
-      def testRequests[F[_]](cl: RedisClient[F])(implicit F: Concurrent[F]): F[List[String]] =
-        (((1 to 50) map { _ =>
-          F.start { cl.send1(lists.lrange[String](testKey, 0L, 1000L)) }
-        }).par map { ioFib =>
-          ioFib flatMap (_.join.attempt)
+      def requests(cl: RedisClient[F]): F[List[String]] =
+        (ParSeq.range(0, 50) map { _ =>
+          concurrent.start { cl.send(lists.lrange[String](key, 0L, 1000L)) }
+        } map { ioFib =>
+          ioFib >>= (_.join.attempt)
         } map {
           _.map(
             _.fold(
@@ -214,15 +199,13 @@ final class RedisClientSpec extends WordSpecLike with Matchers with BeforeAndAft
           )
         }).toList.sequence map (_.flatten)
 
-      val testResponses =
-        (clientUnderTest[IO] evalMap { cl =>
-          testCleanup(cl) *> testPreset(cl) *> testRequests(cl)
-        }).compile.last map (
-          _ getOrElse Nil
-        ) unsafeRunSync ()
+      val responses =
+        (run[List[String]] compose clientUnderTest.use) { cl =>
+          cleanup(cl) *> preset(cl) *> requests(cl)
+        }
 
-      testResponses.size should be(50 * 100)
-      testResponses map (_ should be(testBulk))
+      responses.size should be(50 * 100)
+      responses map (_ should be(bulk))
     }
   }
 }
